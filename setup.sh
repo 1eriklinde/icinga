@@ -255,6 +255,14 @@ APIUSERS
 if [[ -d "${SCRIPT_DIR}/icinga2/conf.d" ]]; then
     log "Copying custom Icinga2 configuration..."
     cp -r "${SCRIPT_DIR}/icinga2/conf.d/"* /etc/icinga2/conf.d/
+    # Replace the generic "localhost" host object name with the actual hostname
+    SERVER_HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
+    SERVER_IP="$(hostname -I | awk '{print $1}')"
+    log "Setting Icinga2 master host to '${SERVER_HOSTNAME}' (${SERVER_IP})..."
+    sed -i "s/object Host \"localhost\"/object Host \"${SERVER_HOSTNAME}\"/" \
+        /etc/icinga2/conf.d/hosts.conf
+    sed -i "s/address  = \"127\.0\.0\.1\"/address  = \"${SERVER_IP}\"/" \
+        /etc/icinga2/conf.d/hosts.conf
 fi
 
 svc enable --now icinga2
@@ -331,11 +339,14 @@ ln -sfn /usr/share/icingaweb2/modules/icingadb /etc/icingaweb2/enabledModules/ic
 cat > /etc/icingaweb2/modules/icingadb/config.ini <<ICINGADBMODULE
 [icingadb]
 resource = "icingadb"
-
-[redis]
-host = "127.0.0.1"
-port = 6380
 ICINGADBMODULE
+
+# redis.ini: [redis1] section is what icingadb-web actually reads (IcingaRedis.php)
+cat > /etc/icingaweb2/modules/icingadb/redis.ini <<REDISINI
+[redis1]
+host = 127.0.0.1
+port = 6379
+REDISINI
 
 cat > /etc/icingaweb2/modules/icingadb/commandtransports.ini <<CMDTRANSPORT
 [icinga2]
@@ -351,11 +362,12 @@ chown -R www-data:icingaweb2 /etc/icingaweb2
 chmod -R 2770 /etc/icingaweb2
 usermod -aG icingaweb2 www-data
 
-# Create admin user in IcingaWeb2 DB
+# Create or update admin user in IcingaWeb2 DB
 ADMIN_HASH="$(php -r "echo password_hash('${ICINGAWEB_ADMIN_PASS}', PASSWORD_DEFAULT);")"
 mysql -u "${ICINGAWEB_DB_USER}" -p"${ICINGAWEB_DB_PASS}" "${ICINGAWEB_DB_NAME}" <<SQL
-INSERT IGNORE INTO icingaweb_user (name, active, password_hash)
-VALUES ('admin', 1, '${ADMIN_HASH}');
+INSERT INTO icingaweb_user (name, active, password_hash)
+VALUES ('admin', 1, '${ADMIN_HASH}')
+ON DUPLICATE KEY UPDATE password_hash='${ADMIN_HASH}', active=1;
 SQL
 
 # ── 9. Apache2 ────────────────────────────────────────────────────────────────
