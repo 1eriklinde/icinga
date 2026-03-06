@@ -27,11 +27,30 @@ svc() {
     for s in "${services[@]}"; do
         [[ "$s" == --* ]] || clean_services+=("$s")
     done
+    # Detect if --now was passed (means enable+start)
+    local do_start=false
+    for s in "${services[@]}"; do
+        [[ "$s" == "--now" ]] && do_start=true
+    done
+
     for name in "${clean_services[@]}"; do
         case "$action" in
-            enable)        true ;;
-            start|*--now*) service "$name" start ;;
-            restart)       service "$name" restart ;;
+            enable)
+                $do_start && service "$name" start || true ;;
+            start) service "$name" start ;;
+            restart)
+                if ! service "$name" restart 2>/dev/null; then
+                    # No SysV init script (e.g. icingadb) — start binary directly
+                    EXEC="$(grep '^ExecStart=' "/lib/systemd/system/${name}.service" 2>/dev/null | sed 's/ExecStart=//' | awk '{print $1}')"
+                    if [[ -n "$EXEC" && -x "$EXEC" ]]; then
+                        pkill -f "$EXEC" 2>/dev/null || true
+                        sleep 1
+                        nohup "$EXEC" >> "/var/log/${name}.log" 2>&1 &
+                        log "Started ${name} directly (no init script): $EXEC"
+                    else
+                        log "Warning: could not restart ${name} — no init script or binary found"
+                    fi
+                fi ;;
             reload)        service "$name" reload ;;
             stop)          service "$name" stop ;;
         esac
@@ -137,6 +156,14 @@ apt-get install -y -qq \
 # ── 4. MariaDB setup ──────────────────────────────────────────────────────────
 log "Configuring MariaDB..."
 svc enable --now mariadb
+
+# Wait for MariaDB socket to be ready
+log "Waiting for MariaDB to be ready..."
+for _ in $(seq 1 30); do
+    mysqladmin ping --silent 2>/dev/null && break
+    sleep 1
+done
+mysqladmin ping --silent 2>/dev/null || die "MariaDB did not start within 30 seconds"
 
 # Secure installation (non-interactive)
 mysql -e "DELETE FROM mysql.user WHERE User='';"
@@ -248,6 +275,11 @@ object ApiUser "root" {
 object ApiUser "icingaweb2" {
   password = "$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 32)"
   permissions = [ "status/query", "actions/*", "objects/modify/*", "objects/query/*" ]
+}
+
+object ApiUser "icinga-scripts" {
+  password = "$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 32)"
+  permissions = [ "objects/query/Host", "objects/modify/Host" ]
 }
 APIUSERS
 
@@ -372,7 +404,10 @@ SQL
 
 # ── 9. Apache2 ────────────────────────────────────────────────────────────────
 log "Configuring Apache2..."
-a2enmod rewrite php* 2>&1 | tee -a "$LOG_FILE" || true
+# Disable all PHP modules first to avoid conflicts (multiple PHP versions cause segfault)
+PHP_MOD="$(php -r 'echo "php" . PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;' 2>/dev/null || echo "php8.3")"
+a2dismod php5.6 php7.0 php7.2 php7.4 php8.0 php8.1 php8.2 php8.3 2>/dev/null || true
+a2enmod rewrite "$PHP_MOD" 2>&1 | tee -a "$LOG_FILE" || true
 
 cat > /etc/apache2/conf-available/icingaweb2.conf <<APACHECONF
 Alias /icingaweb2 "/usr/share/icingaweb2/public"
@@ -407,8 +442,8 @@ Alias /icingaweb2 "/usr/share/icingaweb2/public"
 APACHECONF
 
 a2enconf icingaweb2
-svc enable --now apache2
-svc reload apache2
+svc enable apache2
+svc restart apache2
 
 # ── 10. Copy custom config ────────────────────────────────────────────────────
 if [[ -d "${SCRIPT_DIR}/icingaweb2" ]]; then
@@ -423,19 +458,57 @@ if [[ -d "${SCRIPT_DIR}/scripts" ]]; then
     mkdir -p /opt/icinga-scripts
     cp -r "${SCRIPT_DIR}/scripts/"* /opt/icinga-scripts/
     chmod +x /opt/icinga-scripts/*.sh /opt/icinga-scripts/checks/*.sh 2>/dev/null || true
-    # Load API password into scripts config if not already set
-    if [[ -f /etc/icinga2/conf.d/api-users.conf ]] && \
-       ! grep -q '^ICINGA2_PASS=' /opt/icinga-scripts/config.env 2>/dev/null || \
-       grep -q '^ICINGA2_PASS=""' /opt/icinga-scripts/config.env 2>/dev/null; then
-        log "Patching /opt/icinga-scripts/config.env with API credentials..."
-        API_PASS=$(awk '/object ApiUser "icingaweb2"/{f=1} f && /password/{gsub(/[" ]/,"",$3); print $3; exit}' \
-            /etc/icinga2/conf.d/api-users.conf)
-        sed -i "s|^ICINGA2_PASS=.*|ICINGA2_PASS=\"${API_PASS}\"|" /opt/icinga-scripts/config.env
+    # Bootstrap config.env from example if not present (config.env is gitignored)
+    if [[ ! -f /opt/icinga-scripts/config.env ]] && [[ -f /opt/icinga-scripts/config.env.example ]]; then
+        cp /opt/icinga-scripts/config.env.example /opt/icinga-scripts/config.env
     fi
-    chmod 640 /opt/icinga-scripts/config.env
+    # Bootstrap secrets.env from example if not present (secrets.env is gitignored)
+    if [[ ! -f /opt/icinga-scripts/secrets.env ]] && [[ -f /opt/icinga-scripts/secrets.env.example ]]; then
+        cp /opt/icinga-scripts/secrets.env.example /opt/icinga-scripts/secrets.env
+    fi
+    # Patch Icinga2 API password into secrets.env
+    if [[ -f /opt/icinga-scripts/secrets.env ]] && [[ -f /etc/icinga2/conf.d/api-users.conf ]]; then
+        if ! grep -q '^ICINGA2_PASS=' /opt/icinga-scripts/secrets.env 2>/dev/null || \
+           grep -q '^ICINGA2_PASS=""' /opt/icinga-scripts/secrets.env 2>/dev/null; then
+            log "Patching /opt/icinga-scripts/secrets.env with API credentials..."
+            API_PASS=$(awk '/object ApiUser "icinga-scripts"/{f=1} f && /password/{gsub(/[" ]/,"",$3); print $3; exit}' \
+                /etc/icinga2/conf.d/api-users.conf)
+            sed -i "s|^ICINGA2_PASS=.*|ICINGA2_PASS=\"${API_PASS}\"|" /opt/icinga-scripts/secrets.env
+        fi
+    fi
+    chmod 640 /opt/icinga-scripts/secrets.env 2>/dev/null || true
+    chmod 640 /opt/icinga-scripts/config.env 2>/dev/null || true
+
+    # Run initial host import from QuestDB (skip if QuestDB not configured)
+    QHOST=$(grep '^QUESTDB_HOST=' /opt/icinga-scripts/config.env 2>/dev/null | cut -d= -f2 | tr -d '"')
+    if [[ -n "$QHOST" && "$QHOST" != "localhost" ]]; then
+        log "Running initial host import from QuestDB (${QHOST})..."
+        bash /opt/icinga-scripts/import-hosts-questdb.sh || log "Warning: host import failed — check QuestDB connectivity"
+    else
+        log "Skipping host import: QUESTDB_HOST not configured in /opt/icinga-scripts/config.env"
+    fi
 fi
 
-# ── 11. Go ────────────────────────────────────────────────────────────────────
+# ── 11. HaloITSM notifications (optional) ────────────────────────────────────
+# Enable with: ENABLE_HALO_NOTIFICATIONS=true sudo -E bash setup.sh
+ENABLE_HALO_NOTIFICATIONS="${ENABLE_HALO_NOTIFICATIONS:-false}"
+if [[ "$ENABLE_HALO_NOTIFICATIONS" == "true" ]]; then
+    if [[ -d "${SCRIPT_DIR}/icinga2/zones.d/master" ]]; then
+        log "Deploying HaloITSM notification config..."
+        mkdir -p /etc/icinga2/zones.d/master
+        cp "${SCRIPT_DIR}/icinga2/zones.d/master/"*.conf /etc/icinga2/zones.d/master/
+        chown -R root:nagios /etc/icinga2/zones.d/master/ 2>/dev/null || true
+        chmod 640 /etc/icinga2/zones.d/master/*.conf
+        log "HaloITSM notification config deployed to /etc/icinga2/zones.d/master/"
+        log "Remember to set HALO_URL, HALO_USER, HALO_PASS, and ICINGA2_WEB_URL in /opt/icinga-scripts/config.env and secrets.env"
+    else
+        log "Warning: icinga2/zones.d/master not found in repo — skipping HaloITSM config"
+    fi
+else
+    log "Skipping HaloITSM notification config (set ENABLE_HALO_NOTIFICATIONS=true to enable)"
+fi
+
+# ── 12. Go ────────────────────────────────────────────────────────────────────
 GO_VERSION="${GO_VERSION:-1.22.5}"
 log "Installing Go ${GO_VERSION}..."
 ARCH="$(dpkg --print-architecture)"
@@ -458,11 +531,11 @@ GOPATH
 export PATH=$PATH:/usr/local/go/bin
 log "Go $(/usr/local/go/bin/go version) installed"
 
-# ── 12. Final restart ─────────────────────────────────────────────────────────
+# ── 13. Final restart ─────────────────────────────────────────────────────────
 log "Restarting all services..."
 svc restart redis-server icingadb icinga2 apache2
 
-# ── 13. Summary ───────────────────────────────────────────────────────────────
+# ── 14. Summary ───────────────────────────────────────────────────────────────
 HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
 IP="$(hostname -I | awk '{print $1}')"
 
